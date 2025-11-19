@@ -116,7 +116,7 @@ static inline int AllReduceImpl(const void *sendbuf, void *recvbuf, int count, M
     MPI_Type_size(aggregateType, &dataSize);
 
     size_t bufSize = dataSize * count;
-    size_t blockSize = 48;
+    size_t blockSize = 128;
 
     // std::cout << "Sending " << *(uint32_t*) sendbuf << std::endl;
 
