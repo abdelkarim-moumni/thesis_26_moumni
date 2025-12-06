@@ -5,9 +5,11 @@
 #include <iostream>
 #include <cassert>
 #include <algorithm>
+#include <random>
 
 template <typename I>
-int mpi_perf(size_t num_items, int argc, char *argv[], I unit, MPI_Datatype mpi_type) {
+int mpi_perf(size_t num_items, int argc, char *argv[], I unit, MPI_Datatype mpi_type, bool random_data) {
+  static std::mt19937 random_gen;
   int num_iters = 10;
   bool copy = std::getenv("CUHEAR_COPY");
   bool cpuonly = std::getenv("CUHEAR_NOGPU");
@@ -39,7 +41,7 @@ int mpi_perf(size_t num_items, int argc, char *argv[], I unit, MPI_Datatype mpi_
 
   for (int i = 0; i < num_iters; i++) {
     for (int j = 0; j < num_items; j++) {
-      hostBuf[j] = unit;
+      hostBuf[j] = random_data ? random_gen() : unit;
     }
     if (!cpuonly) {
       CHECK_CUDA_CALL(cudaMemcpy(d_buf, hostBuf, sizeof(I) * num_items, cudaMemcpyHostToDevice));
@@ -56,8 +58,9 @@ int mpi_perf(size_t num_items, int argc, char *argv[], I unit, MPI_Datatype mpi_
     }
     MPI_Allreduce(MPI_IN_PLACE, testBuf, num_items, mpi_type, MPI_SUM, MPI_COMM_WORLD);
     if (copy) {
-      int after = testBuf[0];
-      assert(before * numProcs == after);
+      for (int j = 0; j < num_items; j++) {
+        assert(unit * numProcs == testBuf[j]);
+      }
       if (!cpuonly) {
         CHECK_CUDA_CALL(cudaMemcpy(d_buf, testBuf, sizeof(I) * num_items, cudaMemcpyHostToDevice));
       }

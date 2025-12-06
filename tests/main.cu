@@ -27,17 +27,24 @@ int main(int argc, char** argv) {
     int sizes[] = {
         32,
         128,
- 
+        kib, // 1 KiB
+        32 * kib, // 32 KiB
+        mib, // 1 MiB
+        4 * mib,
+        8 * mib,
+        32 * mib,
+        128 * mib,
+        512 * mib
     };
 
     if (true) {
         MPI_Init(&argc, &argv);
         for (int size : sizes) {
             std::cout << "[TEST] " << size << " Bytes" << std::endl;
-            if (argc == 1) {
-                mpi_perf<uint32_t>(size / 4, argc, argv, 1, MPI_INT);
+            if (argc < 3) {
+                mpi_perf<uint32_t>(size / 4, argc, argv, 1, MPI_INT, argc > 2);
             } else {
-                mpi_perf<float>(size / 4, argc, argv, 4.0, MPI_FLOAT);
+                mpi_perf<float>(size / 4, argc, argv, 4.0, MPI_FLOAT, argc > 3);
             }
         }
         MPI_Finalize();
