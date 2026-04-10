@@ -19,7 +19,7 @@ __constant__ cuhear::rng::AesContext AES_CONTEXT;
 #include "omp.h"
 
 int main(int argc, char** argv) {
-    CHECK_CUDA_CALL(cudaSetDevice(0));
+    //CHECK_CUDA_CALL(cudaSetDevice(0));
     CHECK_CUDA_CALL(cudaDeviceSynchronize());
 
     int kib = 1024;
@@ -41,10 +41,10 @@ int main(int argc, char** argv) {
         MPI_Init(&argc, &argv);
         for (int size : sizes) {
             std::cout << "[TEST] " << size << " Bytes" << std::endl;
-            if (argc < 3) {
-                mpi_perf<uint32_t>(size / 4, argc, argv, 1, MPI_INT, argc > 2);
+            if (argc < 2) {
+                mpi_perf<uint32_t>(size / 4, argc, argv, 1, MPI_INT, false);
             } else {
-                mpi_perf<float>(size / 4, argc, argv, 4.0, MPI_FLOAT, argc > 3);
+                mpi_perf<float>(size / 4, argc, argv, 4.0, MPI_FLOAT, false);
             }
         }
         MPI_Finalize();

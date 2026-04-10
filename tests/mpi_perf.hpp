@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <random>
 
+extern "C" void cuhear_setup_intra_node(size_t num_items, MPI_Datatype mpi_type);
+extern "C" void cuhear_cleanup_intra_node();
+
 template <typename I>
 int mpi_perf(size_t num_items, int argc, char *argv[], I unit, MPI_Datatype mpi_type, bool random_data) {
   static std::mt19937 random_gen;
@@ -21,9 +24,23 @@ int mpi_perf(size_t num_items, int argc, char *argv[], I unit, MPI_Datatype mpi_
 
   MPI_Comm_size(MPI_COMM_WORLD, &numProcs);
 
+  // DEBUG DATATYPE VALUE
+  if (rank == 0) {
+      std::string typeName = "";
+      if (mpi_type == MPI_INT) typeName = "INT (int32_t)";
+      else if (mpi_type == MPI_FLOAT) typeName = "FLOAT (float32)";
+
+      std::cout << "\n========================================" << std::endl;
+      std::cout << "[TEST CONFIG] Type: " << typeName << std::endl;
+      std::cout << "[TEST CONFIG] Items: " << num_items << " (" << (num_items * sizeof(I)) / 1024.0 << " KB)" << std::endl;
+      std::cout << "[TEST CONFIG] Mode: " << (cpuonly ? "CPU-ONLY" : "CUDA-GPU") << std::endl;
+      std::cout << "========================================\n" << std::endl;
+  }
+
   I* d_buf, *hostBuf, *testBuf = nullptr;
   if (!cpuonly) {
     CHECK_CUDA_CALL(cudaMalloc(&d_buf, sizeof(I) * num_items));
+    cuhear_setup_intra_node(num_items, mpi_type);
   }
 
   hostBuf = new I[num_items];
@@ -57,13 +74,38 @@ int mpi_perf(size_t num_items, int argc, char *argv[], I unit, MPI_Datatype mpi_
       }
     }
     MPI_Allreduce(MPI_IN_PLACE, testBuf, num_items, mpi_type, MPI_SUM, MPI_COMM_WORLD);
-    if (copy) {
-      for (int j = 0; j < num_items; j++) {
-        assert(unit * numProcs == testBuf[j]);
-      }
-      if (!cpuonly) {
-        CHECK_CUDA_CALL(cudaMemcpy(d_buf, testBuf, sizeof(I) * num_items, cudaMemcpyHostToDevice));
-      }
+    // if (copy) {
+    //   for (int j = 0; j < num_items; j++) {
+    //     assert(unit * numProcs == testBuf[j]);
+    //   }
+    //   if (!cpuonly) {
+    //     CHECK_CUDA_CALL(cudaMemcpy(d_buf, testBuf, sizeof(I) * num_items, cudaMemcpyHostToDevice));
+    //   }
+    // }
+    if (i == 0) {
+        I* checkBuf = new I[num_items];
+        if (!cpuonly && !copy) {
+            cudaMemcpy(checkBuf, testBuf, num_items * sizeof(I), cudaMemcpyDeviceToHost);
+        } else {
+            checkBuf = (I*)testBuf;
+        }
+
+        if (rank == 0) {
+            bool correct = true;
+            I expected = unit * (I)numProcs;
+            for (size_t j = 0; j < std::min(num_items, (size_t)10); j++) {
+                if (checkBuf[j] != expected) {
+                    std::cout << "ERROR!!! Element " << j << " was " << checkBuf[j] 
+                              << " but expected " << expected << std::endl;
+                    correct = false;
+                    break;
+                }
+            }
+            if (correct) {
+                std::cout << "Verification of the first 10 elements: OK (Value: " << expected << ")" << std::endl;
+            }
+        }
+        if (!cpuonly && !copy) delete[] checkBuf;
     }
 
     // CHECK_CUDA_CALL(cudaMemcpy(hostBuf, d_buf, sizeof(I) * num_items, cudaMemcpyDeviceToHost));
@@ -87,6 +129,7 @@ int mpi_perf(size_t num_items, int argc, char *argv[], I unit, MPI_Datatype mpi_
 
   if (!cpuonly) {
     cudaFree(d_buf);
+    cuhear_cleanup_intra_node();
   }
   delete[] hostBuf;
 

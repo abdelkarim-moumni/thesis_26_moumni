@@ -14,6 +14,20 @@ __device__ inline uint4 VecScalarMul(uint4 a, uint32_t scalar) {
     return { a.x * scalar, a.y * scalar, a.z * scalar, a.w * scalar };
 }
 
+namespace cuhear {
+    __global__ void IntraNodeSum(int size, int num_followers, uint32_t* leader_buf, uint32_t** follower_bufs) {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < size) {
+            uint32_t sum = leader_buf[idx];
+            for (int i = 0; i < num_followers; i++) {
+                sum += follower_bufs[i][idx];
+            }
+            leader_buf[idx] = sum;
+        }
+    }
+}
+
+
 namespace cuhear::kernels::int_sum {
 
     __global__ void encrypt(cuhear::KeyStorage *keys, cuhear::rng::AesContext *aes, void *raw_out, void *raw_in, size_t count, bool isLast) {
