@@ -39,9 +39,22 @@ int main(int argc, char** argv) {
 
     if (true) {
         MPI_Init(&argc, &argv);
+        
+        // check the flag "--float"
+        bool use_float = false;
+        if (argv != nullptr) {
+            for (int i = 1; i < argc; i++) {
+                if (std::string(argv[i]) == "--float") {
+                    use_float = true;
+                    break;
+                }
+            }
+        }
+
         for (int size : sizes) {
             std::cout << "[TEST] " << size << " Bytes" << std::endl;
-            if (argc < 2) {
+            
+            if (!use_float) {
                 mpi_perf<uint32_t>(size / 4, argc, argv, 1, MPI_INT, false);
             } else {
                 mpi_perf<float>(size / 4, argc, argv, 4.0, MPI_FLOAT, false);

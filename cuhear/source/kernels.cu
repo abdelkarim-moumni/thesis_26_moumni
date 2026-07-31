@@ -15,14 +15,15 @@ __device__ inline uint4 VecScalarMul(uint4 a, uint32_t scalar) {
 }
 
 namespace cuhear {
-    __global__ void IntraNodeSum(int size, int num_followers, uint32_t* leader_buf, uint32_t** follower_bufs) {
+    __global__ void IntraNodeChunkSum(int pipeline_chunk_items, int node_size, size_t slice_items, size_t chunk_offset, uint32_t* my_chunk, uint32_t* inbox) {
         int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx < size) {
-            uint32_t sum = leader_buf[idx];
-            for (int i = 0; i < num_followers; i++) {
-                sum += follower_bufs[i][idx];
+        if (idx < pipeline_chunk_items) {
+            uint32_t sum = my_chunk[idx];
+            for (int i = 0; i < node_size - 1; i++) {
+                uint32_t* remote_chunk_in_inbox = inbox + (i * slice_items) + chunk_offset;
+                sum += remote_chunk_in_inbox[idx];
             }
-            leader_buf[idx] = sum;
+            my_chunk[idx] = sum;
         }
     }
 }

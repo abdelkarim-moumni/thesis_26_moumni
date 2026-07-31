@@ -47,12 +47,16 @@ static void InitState() {
 
 static int NewComm(MPI_Comm comm, bool init_state) {
     int comm_size, my_rank;
-    MPI_Comm node_comm;
+    MPI_Comm node_comm, inter_node_comm;
     int node_rank, gpu_count;
 
-    // Split communicator by node and assing GPUs
+    // node-level split and GPU assignment
+    PMPI_Comm_size(comm, &comm_size);
+    PMPI_Comm_rank(comm, &my_rank);
+    
     PMPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
     MPI_Comm_rank(node_comm, &node_rank);
+    
     CUDA_CHECK_EXIT(cudaGetDeviceCount(&gpu_count));
     CUDA_CHECK_EXIT(cudaSetDevice(node_rank % gpu_count));
 
@@ -60,165 +64,130 @@ static int NewComm(MPI_Comm comm, bool init_state) {
         InitState();
     }
 
-    MPI_Comm_size(comm, &comm_size);
-    MPI_Comm_rank(comm, &my_rank);
-
     cuhearState->node_comm = node_comm;
     cuhearState->node_rank = node_rank;
+    MPI_Comm_size(node_comm, &cuhearState->node_size);
 
-    int current_device;
-    cudaGetDevice(&current_device);
+    // node_rank is used as the split colour: all Rank 0 processes from each node
+    // form one communicator, all Rank 1 form another, and so on.
+    PMPI_Comm_split(comm, node_rank, my_rank, &inter_node_comm);
+    cuhearState->inter_node_comm = inter_node_comm;
 
-    int leader_device = current_device;
+    int inter_rank, inter_size;
+    MPI_Comm_rank(inter_node_comm, &inter_rank);
+    MPI_Comm_size(inter_node_comm, &inter_size);
 
-    if (node_rank == 0) {
-        cuhearState->leader_device = current_device;
-    }
-
-    // Intra-node broadcast of the leader device id
-    MPI_Bcast(&cuhearState->leader_device, 1, MPI_INT, 0, node_comm);
-
-    // Leader communicator creation
-    MPI_Comm leader_comm;
-    int color = (node_rank == 0) ? 1 : MPI_UNDEFINED;
-    PMPI_Comm_split(comm, color, my_rank, &leader_comm);
-    cuhearState->leader_comm = leader_comm;
-
-    // Global broadcast of the communicatorKey for synchronization
     uint32_t communicatorKey = (my_rank == root_rank) ? keyGenerator() : 0;
-    int ret = PMPI_Bcast(&communicatorKey, 1, MPI_UNSIGNED, root_rank, comm);
-    if (ret != MPI_SUCCESS) return ret;
+    PMPI_Bcast(&communicatorKey, 1, MPI_UNSIGNED, root_rank, comm);
 
-    if (node_rank == 0) {
-        int leader_rank, leader_size;
-        MPI_Comm_rank(cuhearState->leader_comm, &leader_rank);
-        MPI_Comm_size(cuhearState->leader_comm, &leader_size);
+    uint32_t my_key = keyGenerator();
+    std::vector<uint32_t> peer_keys(inter_size);
 
-        // Key exchange between node leaders
-        std::vector<uint32_t> leader_keys(leader_size);
-        uint32_t my_key = keyGenerator(); 
-        
-        PMPI_Allgather(&my_key, 1, MPI_UNSIGNED, leader_keys.data(), 1, MPI_UNSIGNED, cuhearState->leader_comm);
+    PMPI_Allgather(&my_key, 1, MPI_UNSIGNED, 
+                   peer_keys.data(), 1, MPI_UNSIGNED, 
+                   inter_node_comm);
 
-        cuhear::KeyStorage leaderKeyStorage {
-            .communicatorKey = communicatorKey,
-            .ownKey = my_key,
-            .nextKey = (leader_rank < leader_size - 1) ? leader_keys[leader_rank + 1] : 0,
-            .rootKey = leader_keys[0] // The decryption root is the first leader (leader_rank 0)
-        };
+    cuhear::KeyStorage keyStorage {
+        .communicatorKey = communicatorKey,
+        .ownKey = my_key,
+        .nextKey = (inter_rank < inter_size - 1) ? peer_keys[inter_rank + 1] : 0,
+        .rootKey = peer_keys[0] 
+    };
 
-        cuhear::KeyStoragePtr keyPtr(leaderKeyStorage);
-        cuhearState->commKeys.emplace(comm, std::move(keyPtr));
-    }
+    cuhear::KeyStoragePtr keyPtr(keyStorage);
+    cuhearState->commKeys.emplace(comm, std::move(keyPtr));
+
+    // pipeline streams initialization
+    CUDA_CHECK_EXIT(cudaStreamCreate(&cuhearState->s_compute));
+    CUDA_CHECK_EXIT(cudaStreamCreate(&cuhearState->s_p2p));
 
     return MPI_SUCCESS;
 }
 
 extern "C" void cuhear_cleanup_intra_node() {
-    // Leader-specific cleanup (Rank 0 of the node)
-    if (cuhearState->node_rank == 0) {
-        // Free all remote follower buffers stored in the vector
-        for (uint32_t* ptr : cuhearState->h_follower_bufs) {
-            if (ptr) cudaFree(ptr);
-        }
-        cuhearState->h_follower_bufs.clear();
-        
-        if (cuhearState->d_follower_bufs_ptrs) {
-            cudaFree(cuhearState->d_follower_bufs_ptrs);
-            cuhearState->d_follower_bufs_ptrs = nullptr;
+    if (cuhearState == nullptr) return;
+
+    for (size_t i = 0; i < cuhearState->h_peer_inbox_ptrs.size(); i++) {
+        if (i != (size_t)cuhearState->node_rank && cuhearState->h_peer_inbox_ptrs[i] != nullptr) {
+            cudaIpcCloseMemHandle(cuhearState->h_peer_inbox_ptrs[i]);
         }
     }
-    // Follower-specific cleanup 
-    else {
-        // Close the CUDA IPC memory handle to the leader's buffer
-        if (cuhearState->d_ptr_to_leader) {
-            cudaIpcCloseMemHandle(cuhearState->d_ptr_to_leader);
-            cuhearState->d_ptr_to_leader = nullptr;
-        }
+    cuhearState->h_peer_inbox_ptrs.clear();
+
+    if (cuhearState->d_peer_inbox_ptrs) {
+        cudaFree(cuhearState->d_peer_inbox_ptrs);
+        cuhearState->d_peer_inbox_ptrs = nullptr;
     }
+
+    if (cuhearState->d_inbox_buffer) {
+        cudaFree(cuhearState->d_inbox_buffer);
+        cuhearState->d_inbox_buffer = nullptr;
+    }
+
+    cuhearState->chunk_items = 0;
 }
 
 extern "C" void cuhear_setup_intra_node(size_t num_items, MPI_Datatype mpi_type) {
     int node_rank = cuhearState->node_rank;
+    int node_size = cuhearState->node_size;
     MPI_Comm node_comm = cuhearState->node_comm;
-    
-    int node_size;
-    MPI_Comm_size(node_comm, &node_size);
-    cuhearState->node_size = node_size;
-    
-    int num_followers = node_size - 1;
 
     int type_size;
     MPI_Type_size(mpi_type, &type_size);
-    size_t bufSize = num_items * type_size;
+    cuhearState->type_size = type_size;
 
-    // Allocate memory handles for all potential followers within the node
-    std::vector<cudaIpcMemHandle_t> handles(num_followers > 0 ? num_followers : 1);
-    int current_device;
-    cudaGetDevice(&current_device);
+    cuhearState->chunk_items = num_items / node_size;
+    size_t chunk_bytes = cuhearState->chunk_items * type_size;
+    
+    size_t inbox_size = (node_size > 1) ? (node_size - 1) * chunk_bytes : 0;
 
-    // LEADER (Rank 0): Allocate buffers and generate IPC handles
-    if (node_rank == 0) {
-        cuhearState->leader_device = current_device;
+    int my_gpu_id;
+    cudaGetDevice(&my_gpu_id);
 
-        cuhear_cleanup_intra_node(); 
+    std::vector<int> all_gpu_ids(node_size);
+    MPI_Allgather(&my_gpu_id, 1, MPI_INT, all_gpu_ids.data(), 1, MPI_INT, node_comm);
 
-        if (num_followers > 0) {
-            cuhearState->h_follower_bufs.resize(num_followers);
-            for (int i = 0; i < num_followers; i++) {
-                // Allocate and initialize buffers for each follower
-                CUDA_CHECK_EXIT(cudaMalloc(&cuhearState->h_follower_bufs[i], bufSize));
-                cudaMemset(cuhearState->h_follower_bufs[i], 0, bufSize);
-                // Generate the IPC handle for the allocated buffer
-                cudaIpcGetMemHandle(&handles[i], cuhearState->h_follower_bufs[i]);
+    cudaIpcMemHandle_t my_handle;
+    if (node_size > 1) {
+        CUDA_CHECK_EXIT(cudaMalloc(&cuhearState->d_inbox_buffer, inbox_size));
+        cudaMemset(cuhearState->d_inbox_buffer, 0, inbox_size);
+
+        CUDA_CHECK_EXIT(cudaIpcGetMemHandle(&my_handle, cuhearState->d_inbox_buffer));
+    }
+
+    std::vector<cudaIpcMemHandle_t> all_handles(node_size);
+    MPI_Allgather(&my_handle, sizeof(cudaIpcMemHandle_t), MPI_BYTE, 
+                  all_handles.data(), sizeof(cudaIpcMemHandle_t), MPI_BYTE, node_comm);
+
+    cuhearState->h_peer_inbox_ptrs.assign(node_size, nullptr);
+
+    if (node_size > 1) {
+        for (int i = 0; i < node_size; i++) {
+            if (i == node_rank) {
+                cuhearState->h_peer_inbox_ptrs[i] = cuhearState->d_inbox_buffer;
+                continue;
             }
 
-            // Transfer follower buffer pointers to the device for GPU-side access
-            CUDA_CHECK_EXIT(cudaMalloc(&cuhearState->d_follower_bufs_ptrs, num_followers * sizeof(uint32_t*)));
-            CUDA_CHECK_EXIT(cudaMemcpy(cuhearState->d_follower_bufs_ptrs, 
-                                       cuhearState->h_follower_bufs.data(), 
-                                       num_followers * sizeof(uint32_t*), 
-                                       cudaMemcpyHostToDevice));
-        }
-        cudaDeviceSynchronize();
-    }
+            int target_gpu_id = all_gpu_ids[i];
 
-    // Exchange leader device info and IPC handles across the node
-    MPI_Bcast(&cuhearState->leader_device, 1, MPI_INT, 0, node_comm);
-    MPI_Barrier(node_comm);
-    if (num_followers > 0) {
-        MPI_Bcast(handles.data(), num_followers * sizeof(cudaIpcMemHandle_t), MPI_BYTE, 0, node_comm);
-    }
-    MPI_Barrier(node_comm);
-
-    // FOLLOWER (Rank > 0): Enable Peer-to-Peer access and open IPC handles
-    if (node_rank > 0) {
-        int target_device = cuhearState->leader_device;
-
-        // Enable peer-to-peer access to the leader's device
-        if (current_device != target_device) {
             int can_access;
-            cudaDeviceCanAccessPeer(&can_access, current_device, target_device);
+            cudaDeviceCanAccessPeer(&can_access, my_gpu_id, target_gpu_id);
             if (can_access) {
-                cudaError_t err = cudaDeviceEnablePeerAccess(target_device, 0);
-                if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
-                    printf("[RANK %d] Errore P2P Enable: %s\n", node_rank, cudaGetErrorString(err));
-                }
-            } else {
-                printf("[RANK %d] CRITICO: Hardware non supporta P2P tra %d e %d\n", 
-                        node_rank, current_device, target_device);
+                cudaError_t err = cudaDeviceEnablePeerAccess(target_gpu_id, 0);
             }
+
+            CUDA_CHECK_EXIT(cudaIpcOpenMemHandle((void**)&cuhearState->h_peer_inbox_ptrs[i], 
+                                                 all_handles[i], 
+                                                 cudaIpcMemLazyEnablePeerAccess));
         }
 
-        // Close any existing handle before opening a new one
-        if (cuhearState->d_ptr_to_leader) 
-            cudaIpcCloseMemHandle(cuhearState->d_ptr_to_leader);
-        
-        // Map the specific IPC handle assigned to this follower (index = node_rank - 1)
-        cudaIpcOpenMemHandle((void**)&cuhearState->d_ptr_to_leader, 
-                             handles[node_rank - 1], 
-                             cudaIpcMemLazyEnablePeerAccess);
+        CUDA_CHECK_EXIT(cudaMalloc(&cuhearState->d_peer_inbox_ptrs, node_size * sizeof(uint32_t*)));
+        CUDA_CHECK_EXIT(cudaMemcpy(cuhearState->d_peer_inbox_ptrs, 
+                                   cuhearState->h_peer_inbox_ptrs.data(), 
+                                   node_size * sizeof(uint32_t*), 
+                                   cudaMemcpyHostToDevice));
     }
+
     MPI_Barrier(node_comm);
 }
 
@@ -227,13 +196,30 @@ typedef void (*DEC_K)(cuhear::KeyStorage*, cuhear::rng::AesContext*, void*, size
 
 template <ENC_K encrypt_fn, DEC_K decrypt_fn>
 static inline int AllReduceImpl(const void *sendbuf, void *recvbuf, int count, MPI_Datatype aggregateType, MPI_Op aggregateOp, MPI_Comm comm) {
-    int gpu_count;
-    CUDA_CHECK_EXIT(cudaGetDeviceCount(&gpu_count));
-    int my_gpu = cuhearState->node_rank % gpu_count; 
-    cudaSetDevice(my_gpu);
+    int node_rank = cuhearState->node_rank;
+    int node_size = cuhearState->node_size;
+    int type_size = cuhearState->type_size;
     
-    cudaPointerAttributes ptrAttribs;
-    int ret = 0;
+    // each slice is 1/N of the total vector
+    size_t slice_items = cuhearState->chunk_items; 
+    size_t slice_bytes = slice_items * type_size;
+
+    int num_chunks = 1; 
+    if (slice_bytes > cuhearState->segment_size && cuhearState->segment_size > 0) {
+        // Compute how many whole chunks of 'segment_size' fit in the slice
+        num_chunks = slice_bytes / cuhearState->segment_size;
+        
+        // Ensure at least 1 chunk if rounding yielded zero
+        if (num_chunks == 0) num_chunks = 1;
+    }
+    
+    // Elements per pipeline chunk
+    size_t pipeline_chunk_items = slice_items / num_chunks;
+    // Edge case: if pipeline_chunk_items is 0, force to 1 to keep geometry valid
+    if (pipeline_chunk_items == 0) {
+        pipeline_chunk_items = 1;
+        num_chunks = slice_items;
+    }
 
     if (sendbuf == MPI_IN_PLACE) {
         sendbuf = recvbuf;
@@ -241,168 +227,138 @@ static inline int AllReduceImpl(const void *sendbuf, void *recvbuf, int count, M
 
     uint32_t *d_send = (uint32_t *) sendbuf;
     uint32_t *d_recv = (uint32_t *) recvbuf;
-    uint32_t *d_encSend;
 
-    bool ownSend = false, ownRecv = false;
+    uint32_t *d_encChunk;
+    CUDA_CHECK_EXIT(cudaMalloc(&d_encChunk, slice_bytes));
 
-    int dataSize;
-    MPI_Type_size(aggregateType, &dataSize);
+    int inter_rank, inter_size;
+    PMPI_Comm_rank(cuhearState->inter_node_comm, &inter_rank);
+    PMPI_Comm_size(cuhearState->inter_node_comm, &inter_size);
+    bool isLast = (inter_rank == inter_size - 1);
 
-    size_t bufSize = dataSize * count;
-    size_t blockSize = 128;
+    std::vector<MPI_Request> reqs(num_chunks);
 
-    // std::cout << "Sending " << *(uint32_t*) sendbuf << std::endl;
+    cuhear::kernels::crypto::rotate_key<<<1, 1, 0, cuhearState->s_compute>>>(
+        cuhearState->d_aesContext, 
+        cuhearState->commKeys.at(comm).d_keys
+    );
 
-    if (cuhearState->cudaUnifiedAddressing) {
-        CUDA_CHECK_EXIT(cudaPointerGetAttributes(&ptrAttribs, d_recv));
-        if (ptrAttribs.type != cudaMemoryTypeDevice) {
-            CUDA_CHECK_EXIT(cudaMalloc(&d_recv, bufSize));
-            CUDA_CHECK_EXIT(cudaMemcpy(d_recv, recvbuf, bufSize, cudaMemcpyHostToDevice));
-            ownRecv = true;
-        }
-        CUDA_CHECK_EXIT(cudaPointerGetAttributes(&ptrAttribs, d_send));
-        if (ptrAttribs.type != cudaMemoryTypeDevice) {
-            CUDA_CHECK_EXIT(cudaMalloc(&d_send, bufSize));
-            CUDA_CHECK_EXIT(cudaMemcpy(d_send, sendbuf, bufSize, cudaMemcpyHostToDevice));
-            ownSend = true;
-        }
-    }
-    
-    CUDA_CHECK_EXIT(cudaMalloc(&d_encSend, bufSize));
+    // distributed pipeline loop
+    for (int i = 0; i < num_chunks; i++) {
+        // Geometric offset calculation within the current slice
+        size_t chunk_offset = i * pipeline_chunk_items;
+        size_t current_chunk_items = (i == num_chunks - 1) ? (slice_items - chunk_offset) : pipeline_chunk_items;
+        size_t current_chunk_bytes = current_chunk_items * type_size;
 
-    int rank, csz;
-    MPI_Comm_rank(comm, &rank);
-    MPI_Comm_size(comm, &csz);
+        // intra-node chunked reduce-scatter
+        if (node_size > 1) {
+            for (int target_peer = 0; target_peer < node_size; target_peer++) {
+                if (target_peer == node_rank) continue;
 
-    // 1. Intra-node section: followers send their data to the node leader
-    int node_rank = cuhearState->node_rank;
-    MPI_Comm node_comm = cuhearState->node_comm;
-    // 1.2 Each follower copies its local data to the Leader's allocated buffer via IPC
-    if (node_rank > 0) {
-        // Execute asynchronous IPC device-to-device copy
-        cudaMemcpyAsync(cuhearState->d_ptr_to_leader, d_send, bufSize, cudaMemcpyDeviceToDevice, 0);
-        cudaDeviceSynchronize();
-    }
-    // 1.3 Synchronization barrier: ensure all followers have completed their data transfers
-    // cudaDeviceSynchronize();
-    MPI_Barrier(node_comm);
-    // cudaDeviceSynchronize();
-    // 1.4 Local sum: only the Node Leader (rank 0) performs the reduction
-    if (node_rank == 0) {
-        // DYNAMIC PRE-SUM DEBUG
-        // if (node_rank == 0) {
-        //     uint32_t v_send[3];
-        //     cudaMemcpy(v_send, d_send, 3 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-        //     std::cout << "DEBUG PRE-SOMMA:\n  d_send: " << v_send[0] << " " << v_send[1] << " " << v_send[2] << std::endl;
+                uint32_t* my_chunk_for_peer = d_send + (target_peer * slice_items) + chunk_offset;
+                
+                int slot = (node_rank < target_peer) ? node_rank : node_rank - 1;
+                uint32_t* target_inbox_slot = cuhearState->h_peer_inbox_ptrs[target_peer] + (slot * slice_items) + chunk_offset;
 
-        //     for (int i = 0; i < cuhearState->h_follower_bufs.size(); ++i) {
-        //         uint32_t v_f[3];
-        //         cudaMemcpy(v_f, cuhearState->h_follower_bufs[i], 3 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-        //         std::cout << "  f" << i+1 << ":     " << v_f[0] << " " << v_f[1] << " " << v_f[2] << std::endl;
-        //     }
-        // }
+                cudaMemcpyAsync(target_inbox_slot, my_chunk_for_peer, current_chunk_bytes, cudaMemcpyDeviceToDevice, cuhearState->s_p2p);
+            }
 
-        int threads_per_block = 256;
-        int blocks = (count + threads_per_block - 1) / threads_per_block;
-        int num_followers = cuhearState->node_size - 1;
-        
-        if (num_followers > 0) {
-            // Launch the kernel to sum up data from all followers on the same node
-            cuhear::IntraNodeSum<<<blocks, threads_per_block>>>(
-                count, 
-                num_followers,
-                d_send, 
-                cuhearState->d_follower_bufs_ptrs
+            cudaStreamSynchronize(cuhearState->s_p2p);
+
+            PMPI_Barrier(cuhearState->node_comm);
+
+            int threads = 256;
+            int blocks = (current_chunk_items + threads - 1) / threads;
+            cuhear::IntraNodeChunkSum<<<blocks, threads, 0, cuhearState->s_compute>>>(
+                current_chunk_items, 
+                node_size, 
+                slice_items, 
+                chunk_offset,
+                d_send + (node_rank * slice_items) + chunk_offset, 
+                cuhearState->d_inbox_buffer
             );
         }
-        cudaDeviceSynchronize();
-        // At this point, d_send on the Leader contains the sum for the entire node
 
-        // DEBUG POST-SUM
-        // uint32_t debug_res[3];
-        // cudaMemcpy(debug_res, d_send, 3 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-        // std::cout << "RISULTATO SOMMA d_send: " << debug_res[0] << " " << debug_res[1] << " " << debug_res[2] << std::endl;
-    }
-
-    // 2. Inter-node section: communication between node leaders
-    if (node_rank == 0) {
-        int l_rank, l_size;
-        MPI_Comm_rank(cuhearState->leader_comm, &l_rank);
-        MPI_Comm_size(cuhearState->leader_comm, &l_size);
-
-        bool l_isLast = (l_rank == l_size - 1);
-        
-        // Communicator key is rotated globally at the start of every allreduce
-        cuhear::kernels::crypto::rotate_key<<<1, 1>>>(cuhearState->d_aesContext, cuhearState->commKeys.at(comm).d_keys);
-        CUDA_LAST_EXIT();
-
-        int aes_blocks = (bufSize + 15) / 16;
-
-        encrypt_fn<<<(aes_blocks + blockSize - 1) / blockSize, blockSize>>>(
+        // encryption of the current chunk
+        int aes_blocks = (current_chunk_bytes + 15) / 16;
+        encrypt_fn<<<(aes_blocks + 255) / 256, 256, 0, cuhearState->s_compute>>>(
             cuhearState->commKeys.at(comm).d_keys,
             cuhearState->d_aesContext,
-            d_encSend,
-            d_send,
+            d_encChunk + chunk_offset,
+            d_send + (node_rank * slice_items) + chunk_offset,
             aes_blocks,
-            l_isLast
+            isLast
         );
-        CUDA_LAST_EXIT();
-        CUDA_CHECK_EXIT(cudaDeviceSynchronize());
-        
-        if (cuhearState->mpiCudaAware) {
-            // CUDA-Aware MPI, can use GPU buffers directly
-            ret = PMPI_Allreduce(d_encSend, d_recv, count, aggregateType, aggregateOp, cuhearState->leader_comm);
+
+        cudaStreamSynchronize(cuhearState->s_compute);
+
+        // asynchronous inter-node allreduce
+        if (inter_size == 1) {
+            cudaMemcpyAsync(
+                d_recv + (node_rank * slice_items) + chunk_offset,
+                d_encChunk + chunk_offset,
+                current_chunk_bytes,
+                cudaMemcpyDeviceToDevice,
+                cuhearState->s_compute
+            );
+            cudaStreamSynchronize(cuhearState->s_compute);
+            reqs[i] = MPI_REQUEST_NULL;
         } else {
-            // No GPU support, need to copy buffer to host
-            uint32_t *encSend = new uint32_t[(bufSize + sizeof(uint32_t) - 1) / sizeof(uint32_t)];
-            CUDA_CHECK_EXIT(cudaMemcpy(encSend, d_encSend, bufSize, cudaMemcpyDeviceToHost));
-            ret = PMPI_Allreduce(MPI_IN_PLACE, encSend, count, aggregateType, aggregateOp, cuhearState->leader_comm);
-            if (ret == MPI_SUCCESS) {
-                CUDA_CHECK_EXIT(cudaMemcpy(d_recv, encSend, bufSize, cudaMemcpyHostToDevice));
-            }
-            delete[] encSend;
+            PMPI_Iallreduce(
+                d_encChunk + chunk_offset, 
+                d_recv + (node_rank * slice_items) + chunk_offset, 
+                current_chunk_items, 
+                aggregateType, 
+                aggregateOp, 
+                cuhearState->inter_node_comm, 
+                &reqs[i]
+            );
         }
-
-        if (ret != MPI_SUCCESS) {
-            std::cerr << " MPI error " << ret << std::endl;
-            std::exit(EXIT_FAILURE);
-        }
-        decrypt_fn<<<(aes_blocks + blockSize - 1) / blockSize, blockSize>>>(
-            cuhearState->commKeys.at(comm).d_keys,
-            cuhearState->d_aesContext,
-            d_recv,
-            aes_blocks
-        );
-
-        // uint32_t debug_res[3];
-        // cudaMemcpy(debug_res, d_recv, 3 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
-        // std::cout << "\033[1;32mRISULTATO recv: " << debug_res[0] << " " << debug_res[1] << " " << debug_res[2] << "\033[0m" << std::endl;
-
-        CUDA_LAST_EXIT();        
     }
 
-    // 3. Final intra-node distribution: leader broadcasts the decrypted buffer to all node processes decrypted buffer to the node
-    MPI_Bcast(d_recv, count, aggregateType, 0, cuhearState->node_comm);
-    
+    // post-pipelined
+    PMPI_Waitall(num_chunks, reqs.data(), MPI_STATUSES_IGNORE);
 
-    if (ownRecv) {
-        CUDA_CHECK_EXIT(cudaMemcpy(recvbuf, d_recv, bufSize, cudaMemcpyDeviceToHost));
-        // std::cout << "Received " << *(uint32_t*) recvbuf << std::endl;
+    // Final decryption of the entire accumulated slice
+    int total_aes_blocks = (slice_bytes + 15) / 16;
+    decrypt_fn<<<(total_aes_blocks + 255) / 256, 256>>>(
+        cuhearState->commKeys.at(comm).d_keys,
+        cuhearState->d_aesContext,
+        d_recv + (node_rank * slice_items),
+        total_aes_blocks
+    );
+    cudaDeviceSynchronize();
+    cudaFree(d_encChunk);
+
+    if (node_size > 1) {
+        // Reconstruct the global vector on each GPU's d_recv via intra-node Allgather
+        PMPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, 
+                       d_recv, slice_items, aggregateType, cuhearState->node_comm);
     }
 
-    CUDA_CHECK_EXIT(cudaFree(d_encSend));
-    if (ownSend) CUDA_CHECK_EXIT(cudaFree(d_send));
-    if (ownRecv) CUDA_CHECK_EXIT(cudaFree(d_recv));
-
-    CUDA_CHECK_EXIT(cudaDeviceSynchronize());
-
-    return ret;
+    return MPI_SUCCESS;
 }
 
 int MPI_Init(int *argc, char ***argv) {
     int orig = PMPI_Init(argc, argv);
     if (orig == MPI_SUCCESS) {
         orig = NewComm(MPI_COMM_WORLD, true);
+        
+        if (argc != nullptr && argv != nullptr && *argv != nullptr) {
+            int nargs = *argc;
+            char** args = *argv;
+            for (int i = 1; i < nargs - 1; i++) {
+                if (std::string(args[i]) == "--segment_size") {
+                    cuhearState->segment_size = std::stoull(args[i + 1]);
+                    break;
+                }
+            }
+            if (cuhearState->myRank == 0) {
+                std::cout << "[CUHEAR INIT] segment_size set to: " 
+                          << cuhearState->segment_size << " bytes (" 
+                          << cuhearState->segment_size / 1024.0 / 1024.0 << " MiB)" << std::endl;
+            }
+        }
     }
     return orig;
 }
@@ -411,6 +367,17 @@ int MPI_Init_thread(int *argc, char ***argv, int required, int *provided) {
     int orig = PMPI_Init_thread(argc, argv, required, provided);
     if (orig == MPI_SUCCESS) {
         orig = NewComm(MPI_COMM_WORLD, true);
+        
+        if (argc != nullptr && argv != nullptr && *argv != nullptr) {
+            int nargs = *argc;
+            char** args = *argv;
+            for (int i = 1; i < nargs - 1; i++) {
+                if (std::string(args[i]) == "--segment_size") {
+                    cuhearState->segment_size = std::stoull(args[i + 1]);
+                    break;
+                }
+            }
+        }
     }
     return orig;
 }

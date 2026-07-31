@@ -21,7 +21,7 @@ extern "C" {
 }
 
 namespace cuhear {
-    __global__ void IntraNodeSum(int size, int num_followers, uint32_t* leader_buf, uint32_t** follower_bufs);
+    __global__ void IntraNodeChunkSum(int pipeline_chunk_items, int node_size, size_t slice_items, size_t chunk_offset, uint32_t* my_chunk, uint32_t* inbox);
 
     typedef uint32_t Key;
 
@@ -48,27 +48,30 @@ namespace cuhear {
 
     struct CuHearState {
         uint32_t myRank;
-        // AES context, stored on device
         rng::AesContext *d_aesContext;
-        // Map (stored on the host) for (MPI_Comm, KeyStorage*).
-        // Communicator keys are stored on device
         std::unordered_map<MPI_Comm, KeyStoragePtr> commKeys;
         bool cudaUnifiedAddressing;
         bool mpiCudaAware;
 
-        int node_rank; // local rank at the node  
+        int node_rank; 
         int node_size;
-        MPI_Comm node_comm; // node communicator
-        MPI_Comm leader_comm; // leader communicator
+        MPI_Comm node_comm; 
 
-        // Leader's pointers
-        uint32_t** d_follower_bufs_ptrs = nullptr;
-        std::vector<uint32_t*> h_follower_bufs;
+        // Vertical communicator for the inter-node phase
+        MPI_Comm inter_node_comm;
 
-        // Follower's pointer (P2P access)
-        uint32_t *d_ptr_to_leader = nullptr;
+        uint32_t* d_inbox_buffer = nullptr;
+        std::vector<uint32_t*> h_peer_inbox_ptrs;
+        uint32_t** d_peer_inbox_ptrs = nullptr;
+        std::vector<cudaIpcMemHandle_t> peer_ipc_handles;
 
-        int leader_device;
+        size_t chunk_items;
+        int type_size;
+        std::vector<int> node_gpu_ids;
+
+        size_t segment_size = 1024 * 1024; // Default: 1 MiB in bytes (overridden from command line)
+        cudaStream_t s_compute;   // Stream for local reduction (kernel) and encryption
+        cudaStream_t s_p2p;       // Stream for peer to peer inboxes
     };
 
 }
