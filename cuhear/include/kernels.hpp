@@ -6,7 +6,7 @@
 // Integer sum
 namespace cuhear::kernels::int_sum {
 
-    __global__ void encrypt(cuhear::KeyStorage *keys, cuhear::rng::AesContext *aes, void *out, void *in, size_t count, bool isLast);
+    __global__ void encrypt(cuhear::KeyStorage *keys, cuhear::rng::AesContext *aes, void *out, void *in, size_t count, bool isLast, size_t base_offset = 0);
     __global__ void decrypt(cuhear::KeyStorage *keys, cuhear::rng::AesContext *aes, void *inout, size_t count);
 
 }
@@ -14,7 +14,7 @@ namespace cuhear::kernels::int_sum {
 // Float sum
 namespace cuhear::kernels::float_sum {
 
-    __global__ void encrypt(cuhear::KeyStorage *keys, cuhear::rng::AesContext *aes, void *out, void *in, size_t count, bool isLast);
+    __global__ void encrypt(cuhear::KeyStorage *keys, cuhear::rng::AesContext *aes, void *out, void *in, size_t count, bool isLast, size_t base_offset = 0);
     __global__ void decrypt(cuhear::KeyStorage *keys, cuhear::rng::AesContext *aes, void *inout, size_t count);
 
 }

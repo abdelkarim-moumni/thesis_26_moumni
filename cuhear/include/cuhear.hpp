@@ -57,7 +57,7 @@ namespace cuhear {
         int node_size;
         MPI_Comm node_comm; 
 
-        // Vertical communicator for the inter-node phase
+        // Vertical communicator for the inter-node phase.
         MPI_Comm inter_node_comm;
 
         uint32_t* d_inbox_buffer = nullptr;
@@ -70,8 +70,9 @@ namespace cuhear {
         std::vector<int> node_gpu_ids;
 
         size_t segment_size = 1024 * 1024; // Default: 1 MiB in bytes (overridden from command line)
-        cudaStream_t s_compute;   // Stream for local reduction (kernel) and encryption
-        cudaStream_t s_p2p;       // Stream for peer to peer inboxes
+        cudaStream_t s_compute; // Stream for local reduction (kernel) and encryption
+        cudaStream_t s_p2p; // Stream for async PCIe/NVLink copies to peer inboxes
     };
 
 }
+

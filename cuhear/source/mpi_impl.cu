@@ -76,7 +76,7 @@ static int NewComm(MPI_Comm comm, bool init_state) {
     int inter_rank, inter_size;
     MPI_Comm_rank(inter_node_comm, &inter_rank);
     MPI_Comm_size(inter_node_comm, &inter_size);
-
+    
     uint32_t communicatorKey = (my_rank == root_rank) ? keyGenerator() : 0;
     PMPI_Bcast(&communicatorKey, 1, MPI_UNSIGNED, root_rank, comm);
 
@@ -191,7 +191,7 @@ extern "C" void cuhear_setup_intra_node(size_t num_items, MPI_Datatype mpi_type)
     MPI_Barrier(node_comm);
 }
 
-typedef void (*ENC_K)(cuhear::KeyStorage*, cuhear::rng::AesContext*, void*, void*, size_t, bool);
+typedef void (*ENC_K)(cuhear::KeyStorage*, cuhear::rng::AesContext*, void*, void*, size_t, bool, size_t);
 typedef void (*DEC_K)(cuhear::KeyStorage*, cuhear::rng::AesContext*, void*, size_t);
 
 template <ENC_K encrypt_fn, DEC_K decrypt_fn>
@@ -200,7 +200,6 @@ static inline int AllReduceImpl(const void *sendbuf, void *recvbuf, int count, M
     int node_size = cuhearState->node_size;
     int type_size = cuhearState->type_size;
     
-    // each slice is 1/N of the total vector
     size_t slice_items = cuhearState->chunk_items; 
     size_t slice_bytes = slice_items * type_size;
 
@@ -215,7 +214,6 @@ static inline int AllReduceImpl(const void *sendbuf, void *recvbuf, int count, M
     
     // Elements per pipeline chunk
     size_t pipeline_chunk_items = slice_items / num_chunks;
-    // Edge case: if pipeline_chunk_items is 0, force to 1 to keep geometry valid
     if (pipeline_chunk_items == 0) {
         pipeline_chunk_items = 1;
         num_chunks = slice_items;
@@ -245,7 +243,6 @@ static inline int AllReduceImpl(const void *sendbuf, void *recvbuf, int count, M
 
     // distributed pipeline loop
     for (int i = 0; i < num_chunks; i++) {
-        // Geometric offset calculation within the current slice
         size_t chunk_offset = i * pipeline_chunk_items;
         size_t current_chunk_items = (i == num_chunks - 1) ? (slice_items - chunk_offset) : pipeline_chunk_items;
         size_t current_chunk_bytes = current_chunk_items * type_size;
@@ -287,7 +284,8 @@ static inline int AllReduceImpl(const void *sendbuf, void *recvbuf, int count, M
             d_encChunk + chunk_offset,
             d_send + (node_rank * slice_items) + chunk_offset,
             aes_blocks,
-            isLast
+            isLast,
+            chunk_offset
         );
 
         cudaStreamSynchronize(cuhearState->s_compute);
@@ -330,8 +328,8 @@ static inline int AllReduceImpl(const void *sendbuf, void *recvbuf, int count, M
     cudaDeviceSynchronize();
     cudaFree(d_encChunk);
 
+    // final intra-node phase: all-gather
     if (node_size > 1) {
-        // Reconstruct the global vector on each GPU's d_recv via intra-node Allgather
         PMPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, 
                        d_recv, slice_items, aggregateType, cuhearState->node_comm);
     }
@@ -426,3 +424,4 @@ int MPI_Allreduce(const void *sendbuf, void *recvbuf, int count, MPI_Datatype da
 
     return PMPI_Allreduce(sendbuf, recvbuf, count, datatype, op, comm);
 }
+

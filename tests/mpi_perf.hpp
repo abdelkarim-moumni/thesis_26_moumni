@@ -93,7 +93,7 @@ int mpi_perf(size_t num_items, int argc, char *argv[], I unit, MPI_Datatype mpi_
         if (rank == 0) {
             bool correct = true;
             I expected = unit * (I)numProcs;
-            for (size_t j = 0; j < std::min(num_items, (size_t)10); j++) {
+            for (size_t j = 0; j < num_items; j++) {
                 if (checkBuf[j] != expected) {
                     std::cout << "ERROR!!! Element " << j << " was " << checkBuf[j] 
                               << " but expected " << expected << std::endl;
@@ -102,7 +102,7 @@ int mpi_perf(size_t num_items, int argc, char *argv[], I unit, MPI_Datatype mpi_
                 }
             }
             if (correct) {
-                std::cout << "Verification of the first 10 elements: OK (Value: " << expected << ")" << std::endl;
+                std::cout << "Verification of the vector: OK (Value: " << expected << ")" << std::endl;
             }
         }
         if (!cpuonly && !copy) delete[] checkBuf;
@@ -135,3 +135,4 @@ int mpi_perf(size_t num_items, int argc, char *argv[], I unit, MPI_Datatype mpi_
 
   return 0;
 }
+

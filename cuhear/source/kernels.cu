@@ -17,8 +17,10 @@ __device__ inline uint4 VecScalarMul(uint4 a, uint32_t scalar) {
 namespace cuhear {
     __global__ void IntraNodeChunkSum(int pipeline_chunk_items, int node_size, size_t slice_items, size_t chunk_offset, uint32_t* my_chunk, uint32_t* inbox) {
         int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        
         if (idx < pipeline_chunk_items) {
             uint32_t sum = my_chunk[idx];
+            
             for (int i = 0; i < node_size - 1; i++) {
                 uint32_t* remote_chunk_in_inbox = inbox + (i * slice_items) + chunk_offset;
                 sum += remote_chunk_in_inbox[idx];
@@ -31,7 +33,7 @@ namespace cuhear {
 
 namespace cuhear::kernels::int_sum {
 
-    __global__ void encrypt(cuhear::KeyStorage *keys, cuhear::rng::AesContext *aes, void *raw_out, void *raw_in, size_t count, bool isLast) {
+    __global__ void encrypt(cuhear::KeyStorage *keys, cuhear::rng::AesContext *aes, void *raw_out, void *raw_in, size_t count, bool isLast, size_t base_offset) {
         __shared__ uint4 rkS[AES_ROUND_KEY_COUNT];
 
         if (threadIdx.x < AES_ROUND_KEY_COUNT) {
@@ -45,6 +47,8 @@ namespace cuhear::kernels::int_sum {
         }
         index *= 4;
 
+        const uint32_t noise_index = index + (uint32_t) base_offset;
+
         uint32_t *out = (uint32_t *) raw_out, *in = (uint32_t *) raw_in;
 
         cuhear::Key tmp1 = keys->communicatorKey + keys->ownKey;
@@ -52,9 +56,9 @@ namespace cuhear::kernels::int_sum {
         uint4 data { in[index], in[index + 1], in[index + 2], in[index + 3] };
 
         uint4 ind1 { 3 + tmp1, 2 + tmp1, 1 + tmp1, tmp1 };
-        ind1 = VecAdd(ind1, {index, index, index, index});
+        ind1 = VecAdd(ind1, {noise_index, noise_index, noise_index, noise_index});
         uint4 ind2 { 3 + tmp2, 2 + tmp2, 1 + tmp2, tmp2 };
-        ind2 = VecAdd(ind2, {index, index, index, index});
+        ind2 = VecAdd(ind2, {noise_index, noise_index, noise_index, noise_index});
 
         uint4 noise1 = aes->GenNoiseB(ind1, rkS);
         uint4 noise2 = aes->GenNoiseB(ind2, rkS);
@@ -101,7 +105,7 @@ namespace cuhear::kernels::int_sum {
 
 namespace cuhear::kernels::float_sum {
 
-    __global__ void encrypt(cuhear::KeyStorage *keys, cuhear::rng::AesContext *aes, void *raw_out, void *raw_in, size_t count, bool isLast) {
+    __global__ void encrypt(cuhear::KeyStorage *keys, cuhear::rng::AesContext *aes, void *raw_out, void *raw_in, size_t count, bool isLast, size_t base_offset) {
         __shared__ uint4 rkS[AES_ROUND_KEY_COUNT];
 
         if (threadIdx.x < AES_ROUND_KEY_COUNT) {
@@ -115,11 +119,13 @@ namespace cuhear::kernels::float_sum {
         }
         index *= 4;
 
+        const uint32_t noise_index = index + (uint32_t) base_offset;
+
         float *out = (float *) raw_out, *in = (float *) raw_in;
 
         cuhear::Key tmp = keys->communicatorKey;
         uint4 ind { tmp + 1, tmp + 2, tmp + 3, tmp + 4 };
-        ind = VecAdd(ind, {index, index, index, index});
+        ind = VecAdd(ind, {noise_index, noise_index, noise_index, noise_index});
         uint4 tmpNoise = aes->GenNoiseB(ind, rkS);
         cuhear::floats::FloatBits *noise = reinterpret_cast<cuhear::floats::FloatBits *>(&tmpNoise);
 
@@ -187,4 +193,5 @@ namespace cuhear::kernels::crypto {
     }
 
 }
+
 

@@ -40,7 +40,6 @@ int main(int argc, char** argv) {
     if (true) {
         MPI_Init(&argc, &argv);
         
-        // check the flag "--float"
         bool use_float = false;
         if (argv != nullptr) {
             for (int i = 1; i < argc; i++) {
